@@ -3,85 +3,85 @@ import pandas as pd
 import numpy as np
 import json
 import os
-import webbrowser
 from datetime import timedelta
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-print("--- MOBILE CHASER V5: HYBRID ACCURACY ---")
-print("(Using Real SSO/UPRO Data + Synthetic Backfill)")
+print("--- MOBILE CHASER V6: ROBUST SERVER VERSION ---")
 
 BENCHMARK_TICKER = 'SPY' 
 SMA_PERIOD = 300          
 START_CAPITAL = 10000
 
-# Constants for Synthetic Backfill (Pre-2009)
+# Constants for Synthetic Backfill
+# We use a static Risk Free Rate (4%) to prevent download errors with ^IRX
+FIXED_RISK_FREE_RATE = 0.04 
 BROKER_SPREAD = 0.005 / 252   
 DAILY_EXPENSE = 0.011 / 252   
 
 # ==========================================
-# 2. HYBRID DATA ENGINE
+# 2. ROBUST DATA ENGINE
 # ==========================================
 def fetch_hybrid_data():
-    print("1. Downloading Data (SPY, SSO, UPRO, IRX)...")
+    print("1. Downloading Data Separately (Safer for Automation)...")
     
-    # We download EVERYTHING now
-    tickers = [BENCHMARK_TICKER, 'SSO', 'UPRO', '^IRX']
-    raw_df = yf.download(tickers, start='2000-01-01', progress=False, group_by='ticker', auto_adjust=False)
-    
-    # Helper to safely grab 'Adj Close'
-    def get_adj_close(ticker):
+    # Helper to download a single ticker safely
+    def get_clean_series(ticker):
         try:
-            if isinstance(raw_df.columns, pd.MultiIndex):
-                return raw_df[ticker]['Adj Close']
+            print(f"   Fetching {ticker}...")
+            # Download single ticker (returns simple DataFrame, no MultiIndex confusion)
+            d = yf.download(ticker, start='2000-01-01', progress=False, auto_adjust=False)
+            
+            # Handle cases where yfinance returns a MultiIndex columns
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            
+            # Prefer 'Adj Close', fallback to 'Close'
+            if 'Adj Close' in d.columns:
+                return d['Adj Close']
+            elif 'Close' in d.columns:
+                return d['Close']
             else:
-                # If single level (unlikely with multiple tickers, but safe)
-                col = f"{ticker}" if ticker in raw_df.columns else f"Adj Close"
-                return raw_df[col]
-        except KeyError:
-            print(f"Warning: Could not find data for {ticker}")
-            return pd.Series(np.nan, index=raw_df.index)
+                return d.iloc[:, 0] # Grab first column if all else fails
+        except Exception as e:
+            print(f"   Error fetching {ticker}: {e}")
+            return pd.Series(dtype=float)
 
-    # Extract Series
-    spy_price = get_adj_close(BENCHMARK_TICKER)
-    sso_price = get_adj_close('SSO')
-    upro_price = get_adj_close('UPRO')
-    irx_price = get_adj_close('^IRX')
+    # 1. Fetch Series Individually
+    spy_price = get_clean_series(BENCHMARK_TICKER)
+    sso_price = get_clean_series('SSO')
+    upro_price = get_clean_series('UPRO')
+    
+    # Drop rows where SPY is missing (Market holidays etc)
+    spy_price = spy_price.dropna()
 
     # Build Core DataFrame
     df = pd.DataFrame(index=spy_price.index)
     df['Price'] = spy_price
-    df['RiskFree_Rate'] = (irx_price / 100) / 252
-    df['RiskFree_Rate'] = df['RiskFree_Rate'].fillna(0.02/252)
     
-    # 1. Calculate Signals on BENCHMARK (SPY)
+    # Use fixed risk free rate (safer than downloading ^IRX)
+    df['RiskFree_Rate'] = FIXED_RISK_FREE_RATE / 252
+    
+    # 2. Calculate Signals on BENCHMARK (SPY)
     df['SMA'] = df['Price'].rolling(window=SMA_PERIOD).mean()
     df['Signal'] = np.where(df['Price'].shift(1) > df['SMA'].shift(1), 1, 0)
     
-    # 2. Calculate Returns
+    # 3. Calculate Returns
     df['SPY_Ret'] = df['Price'].pct_change().fillna(0)
     df['SSO_Ret_Real'] = sso_price.pct_change()
     df['UPRO_Ret_Real'] = upro_price.pct_change()
     
-    # 3. Generate Synthetic Data (For Backfill)
-    # Cost to borrow for synthetic calc
+    # 4. Generate Synthetic Data (For Backfill)
     cost_of_money = df['RiskFree_Rate'] + BROKER_SPREAD
-    
-    # Synthetic 2x: (SPY * 2) - Cost
     df['SSO_Ret_Synth'] = (df['SPY_Ret'] * 2) - (cost_of_money * 1) - DAILY_EXPENSE
-    
-    # Synthetic 3x: (SPY * 3) - Cost
     df['UPRO_Ret_Synth'] = (df['SPY_Ret'] * 3) - (cost_of_money * 2) - DAILY_EXPENSE
     
-    # 4. SPLICE: Real combined with Synthetic
-    # "Use Real if available, otherwise use Synthetic"
+    # 5. SPLICE: Real combined with Synthetic
     df['SSO_Final'] = df['SSO_Ret_Real'].combine_first(df['SSO_Ret_Synth'])
     df['UPRO_Final'] = df['UPRO_Ret_Real'].combine_first(df['UPRO_Ret_Synth'])
     
-    # 5. Apply Strategy
-    # If Signal is 1 (Bull): Get the FINAL Leveraged Return (Real or Synth)
-    # If Signal is 0 (Bear): Get Risk Free Rate
+    # 6. Apply Strategy
     df['Strat_2x'] = np.where(df['Signal'] == 1, df['SSO_Final'], df['RiskFree_Rate'])
     df['Strat_3x'] = np.where(df['Signal'] == 1, df['UPRO_Final'], df['RiskFree_Rate'])
     
@@ -90,7 +90,7 @@ def fetch_hybrid_data():
     df['Eq_3x'] = START_CAPITAL * (1 + df['Strat_3x']).cumprod()
     df['Eq_Bench'] = START_CAPITAL * (1 + df['SPY_Ret']).cumprod()
     
-    # Clean up start
+    # Clean up any remaining NaNs at the start
     df = df.dropna(subset=['Eq_2x', 'Eq_3x'])
     
     return df
@@ -100,9 +100,13 @@ def fetch_hybrid_data():
 # ==========================================
 try:
     df = fetch_hybrid_data()
+    # Check if data is valid
+    if df.empty or np.isnan(df['Price'].iloc[-1]):
+        print("CRITICAL ERROR: Data fetch resulted in empty or NaN values.")
+        exit(1) # Fail the build so we know
 except Exception as e:
     print(f"Error: {e}")
-    exit()
+    exit(1)
 
 # Data for Chart
 lookback = 750 
@@ -121,7 +125,7 @@ color_red = "#FF0055"
 signal_color = color_green if is_bullish else color_red
 status_msg = f"Price is {abs(distance_pct):.1f}% {'ABOVE' if is_bullish else 'BELOW'} the {SMA_PERIOD}-Day SMA."
 
-# YTD Calculation (Prior Year Close Method)
+# YTD Calculation
 current_year = df.index[-1].year
 last_year = current_year - 1
 last_year_data = df[df.index.year == last_year]
@@ -257,4 +261,5 @@ output_file = "index.html"
 with open(output_file, "w", encoding="utf-8") as f:
     f.write(html_final)
 
-print(f"\nSUCCESS! App generated: {os.path.abspath(output_file)}")
+print(f"\nSUCCESS! App generated: {output_file}")
+# Note: webbrowser.open is REMOVED because servers don't have screens.
